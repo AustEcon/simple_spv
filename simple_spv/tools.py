@@ -30,24 +30,26 @@ class DbManager:
         """data integrity check"""
         if len(headers) == 0:
             print('no further headers received; abort append')
-            return
+            return False
         base_height_new_headers = headers[0]['height']
         if os.path.isfile(file):
             try:
                 # check data integrity of db
-                with open(file, 'r') as f:
-                    db = cls.load_db(file)
-                    assert isinstance(db, list)  # List of...
+                db = cls.load_db(file)
+                assert isinstance(db, list)  # List of...
+                # if empty headers.json
+                if len(db) == 0 and base_height_new_headers == 1:
+                    return True
 
-                    if len(db) > 0:
-                        assert isinstance(db[0], dict)  # Dicts...
-                        # check that new headers begin at precisely the very next block in the sequence
-                        top_height_db = db[len(db) - 1]["height"]
-                        er_msg = ("new headers are out of sequence at base height: " + str(base_height_new_headers) +
-                                  " compared to db at height: " + str(top_height_db))
-                        print("checking!")
-                        assert top_height_db == base_height_new_headers - 1, er_msg
-                        return True
+                if len(db) > 0:
+                    assert isinstance(db[0], dict)  # Dicts...
+                    # check that new headers begin at precisely the very next block in the sequence
+                    top_height_db = db[len(db) - 1]["height"]
+                    er_msg = ("new headers are out of sequence at base height: " + str(base_height_new_headers) +
+                              " compared to db at height: " + str(top_height_db))
+                    print("checking!")
+                    assert top_height_db == base_height_new_headers - 1, er_msg
+                    return True
 
             except IOError as e:
                 print(e)
@@ -56,8 +58,10 @@ class DbManager:
 
         else:
             # create new with 'w' mode
-            print("file is empty. creating new...")
+            print("No file exists. creating new before append...")
             cls.new_db(file)
+            if base_height_new_headers == 1:
+                return True
 
     @classmethod
     def append_to_db(cls, file, headers):
@@ -75,6 +79,7 @@ class DbManager:
                 print(stop, 'sec')
 
         else:
+            print("something went wrong")
             return
 
     @staticmethod

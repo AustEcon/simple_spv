@@ -135,6 +135,11 @@ class Deserialize:
         return nonce
 
     @classmethod
+    def deserialize_pong(cls, f):
+        nonce = bitcoinx.read_le_uint64(f.read)
+        return nonce
+
+    @classmethod
     def deserialize_addr(cls, f):
         count = bitcoinx.read_varint(f.read)
         addresses = []
@@ -552,6 +557,7 @@ class Handlers:
     def handle_headers(cls, sock, message_header, message):
         global db
         global previous_validation_height
+        global temp_headers_store
         # Validate this batch of headers (operates on binary "headers_stream")
         print("validating batch of block headers... (", db_height + 1, " to ", db_height + len(message) + 1, ")")
         time_start = time.time()
@@ -600,6 +606,7 @@ class Handlers:
                       "(previously validated height was:", previous_validation_height)
                 pass
 
+            # TODO package all of this next part up into a separate function because I want to use it in case of timeout
             # Avoid unnecessary loading from disc
             if len(temp_headers_store) is not 0:
                 db.extend(temp_headers_store)
@@ -611,21 +618,27 @@ class Handlers:
             if previous_validation_height > 1:
                 Validate.validate_batch_difficulty(db[previous_validation_height - 2000:], db)
                 stop = time.time() - start
-                print("Validation time:", stop, 'sec for latest', 2000, "headers.")
-            stop = time.time() - start
+                num_validated = len(db) - (previous_validation_height - 2000)
+                print("Validation time:", stop, 'sec for latest', num_validated, "headers.")
+
             print("saving new validation height")
             previous_validation_height = db_height  # update
 
             # TODO Should then trigger BitIndex look up of UTXOs using private key
 
             print("handle_headers done...")
+            temp_headers_store = []
 
         return
 
     @classmethod
     def handle_ping(cls, sock, message_header, message):
         nonce = message
-        print(nonce)
+        return sock.send_pong(nonce)
+
+    @classmethod
+    def handle_pong(cls, sock, message_header, message):
+        nonce = message
         return sock.send_pong(nonce)
 
     @classmethod
@@ -666,9 +679,10 @@ class SimpleSPV(object):
 
     def __init__(self):
         self.peers = self.get_peers()
-        self.ip = random.choice(self.peers)
+        self.ip = self.peers[0]
         self.sock = self.get_socket(self.ip)
         self.buffer = io.BytesIO()
+        self.peer_index = 0
 
     def __repr__(self):
         return self.__class__.__name__ + " Object"
@@ -707,6 +721,10 @@ class SimpleSPV(object):
     def send_verack(self):
         return self.sock.send(Serialize.make_final_message("verack", Serialize.verack_payload()))
 
+    def send_ping(self):
+        nonce = random.randint(0, 2**64 - 1)
+        return self.sock.send(Serialize.make_final_message("ping", Serialize.ping_payload(nonce)))
+
     def send_pong(self, nonce):
         return self.sock.send(Serialize.make_final_message("pong", Serialize.pong_payload(nonce)))
 
@@ -723,7 +741,15 @@ class SimpleSPV(object):
 
     # TODO I'm getting a lot of time outs halfway through sync... implement try / except and save db and reconnect.
     def receive_raw_bytes(self, buffer_size):
-        return self.sock.recv(buffer_size)
+        try:
+            self.sock.settimeout(20)  # 20 second timeout for waiting on new data
+            return self.sock.recv(buffer_size)
+        except IOError:
+            global temp_headers_store
+            print("CURRENT LEN HEADERS STORE:", len(temp_headers_store))
+            self.save_validate_and_reconnect(temp_headers_store)
+            print("emptying temp_headers_store...")
+            temp_headers_store = []
 
     def close(self):
         """close the socket"""
@@ -733,7 +759,10 @@ class SimpleSPV(object):
         """selects appropriate handler function"""
         message_header_command = message_header['command']
         handler_func_name = "handle_" + message_header_command
-        print(handler_func_name)
+        if handler_func_name == "handle_pong":
+            pass
+        else:
+            print(handler_func_name)
         handler_func = getattr(Handlers, handler_func_name, None)
         handler_func(self, message_header, message)
 
@@ -756,8 +785,7 @@ class SimpleSPV(object):
             if buffer_size < struct.calcsize("i 12s i i"):
                 print("incomplete header")
                 self.buffer.seek(0, os.SEEK_END)
-                self.buffer.write(
-                    self.sock.recv(1024 * 8))  # potentially blocking but I'll risk it... should be more to come...
+                self.buffer.write(self.receive_raw_bytes(1024 * 8))
                 continue  # return to top of loop to try again with hopefully complete header
 
             # check if message begins with network magic as expected
@@ -785,7 +813,7 @@ class SimpleSPV(object):
             if buffer_size < total_length:
                 # print('buffer size less than total length of message')
                 self.buffer.seek(0, os.SEEK_END)  # puts buffer to end so that recv(1024*8) is appended to the end
-                self.buffer.write(self.sock.recv(1024 * 8))
+                self.buffer.write(self.receive_raw_bytes(1024 * 8))
                 continue  # go directly to top of loop to try again with hopefully complete message
 
             # Read in payload
@@ -804,7 +832,10 @@ class SimpleSPV(object):
                     # Call appropriate deserialization function from deserializers class
                 message_header_command = message_header['command']
                 deser_func_name = "deserialize_" + message_header_command
-                print(deser_func_name)
+                if deser_func_name == "deserialize_pong":
+                    pass
+                else:
+                    print(deser_func_name)
                 deser_func = getattr(Deserialize, deser_func_name, None)
 
                 f = io.BytesIO(payload)
@@ -820,6 +851,31 @@ class SimpleSPV(object):
 
     def start_daemon(self):
         spv_daemon(self)
+
+    def save_validate_and_reconnect(self, temp_headers_store):
+        global db
+        global db_height
+        print("connection timed out")
+        print("length temp_headers_store:", len(temp_headers_store))
+        print("Saving current progress to database...")
+        tools.DbManager.append_to_db('headers.json', temp_headers_store)
+
+        print("loading full db...")
+        db = tools.DbManager.load_db('headers.json')
+
+        print("len db = ", len(db))
+
+        print("validating database difficulty adjustment")  # whole database validation
+        start = time.time()
+        faster_validate.validate_batch_difficulty(db, db)
+        stop = time.time() - start
+        print("Validation time:", stop, 'sec for', db_height, "headers.")
+
+        print("Reconnecting...")
+        self.peer_index += 1
+        self.get_socket(self.peers[self.peer_index])  # try next peer in list
+        self.send_version()
+
 
 def check_for_existing_database():
     print("checking for existing database...")
@@ -885,9 +941,10 @@ def spv_daemon(sock):
                 data = sock.receive_raw_bytes(1024 * 8)
 
             if not data:
-                print('Close the connection')
-                sock.close()
-                break
+                global temp_headers_store
+                sock.save_validate_and_reconnect(temp_headers_store)
+                sock.buffer = io.BytesIO()  # empty buffer and start over
+                continue
 
             sock.buffer.write(data)
             sock.buffer.seek(0)
@@ -900,6 +957,8 @@ def spv_daemon(sock):
                 sock.handle(message_header, message)
                 # log
                 outfile.write(str(message_header) + '\n')
+
+            sock.send_ping()
 
 
 if __name__ == '__main__':

@@ -51,6 +51,11 @@ class Serialize:
         return payload
 
     @staticmethod
+    def ping_payload(nonce):
+        payload = bitcoinx.pack_le_uint64(nonce)
+        return payload
+
+    @staticmethod
     def get_headers_payload(block_locator_hash,
                             hash_stop="0000000000000000000000000000000000000000000000000000000000000000"):
         """makes a getheaders serialized payload"""
