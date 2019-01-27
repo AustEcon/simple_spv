@@ -1,0 +1,12 @@
+*.log
+*.pyc
+*.orig
+__pycache__
+/.cache
+/.idea
+/bitcash.egg-info
+/build
+/dist
+/docs/build
+/wheelhouse
+/simple_spv/logger.txt
